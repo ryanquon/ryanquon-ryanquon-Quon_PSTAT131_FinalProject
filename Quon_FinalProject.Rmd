@@ -1,0 +1,604 @@
+---
+title: "Predicting Pitcher ERA (NCAA Division 1)"
+author: "Ryan Quon"
+date: '2022-10-30'
+output: 
+  html_document:
+    toc: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = F,message = F)
+knitr::opts_chunk$set(fig.width=9)
+knitr::opts_chunk$set(fig.height=9)
+```
+
+![](C:/Users/ryanc/OneDrive/Desktop/PSTAT131/Final%20Project/NCAA%20Baseball%20Logo.jpg)
+
+# Introduction
+
+Earned Run Average (ERA) is one of the most popular pitching statistics in all of baseball ranging from youth leagues, to college (NCAA) baseball, all the way to the professional level. In short, ERA captures the rate of how many runs a pitcher allows. The lower the number the better the pitcher is at preventing runs from scoring and on the other hand, the higher the number, the worse a pitcher is at preventing runs from scoring. For example, UCSB pitcher, Cory Lewis, had a better 2022 season becaues he had 3.57 ERA, while UC Irvine pitcher, Michael Frias, had a higher 5.19 ERA. The metric is a simple calculation as it is as follows... $$ \frac{Earned Runs *9}{Innings Pitched}$$
+
+Although the calculation of the metric is simple, there are many variables/factors that have an impact on the number of runs pitchers allow. The rise of advanced metrics in baseball in addition to the traditional pitching statistics inspires the predictive question of "What will a given pitcher's ERA be this season?" Through producing machine learning models, this is the question this project is attempting to answer.
+
+# Packages
+
+```{r,warning=F, message= F}
+library(corrplot)   
+library(discrim)  
+library(knitr)
+library(recipes)
+library(MASS)   
+library(tidyverse)    
+library(tidymodels)
+library(ggplot2)  
+library(ggrepel)
+library(rpart.plot)  
+library(vip)          
+library(janitor)     
+library(randomForest)   
+library(stringr)   
+library(dplyr)     
+library(yardstick)
+library(xgboost)
+tidymodels_prefer()
+```
+
+# Data
+
+In NCAA Division 1 baseball, many stadiums use a data tracking technology called Trackman to capture advanced metrics. With UCSB Baseball being a Division 1 team with Trackman, the team has access to the Trackman data. The data used in this project is a Trackman dataset consisting of many teams' games from 2019 through 2022. A few important points to note in the dataset:
+
+-   Not every stadium in the country captures data using this technology
+-   Division 1 games only
+
+The Trackman dataset is a large dataset which contains 1,144,455 rows and 64 columns.
+
+The 3 datasets that contain Season Pitching in the name are from D1baseball.com and consist of pitchers' ERAs from 2019, 2021, 2022. I joined the trackman dataset with the ERA data using a left join in the preprocessing section.
+
+Due to the data being confidential to the baseball team, I am unable to include the entire Trackman dataset but I have included my created and primarily used in this project summary dataset named, `pitcher_year`.
+
+```{r}
+ERA_2022 <-  read_csv('data/2022 Season Pitching.csv')
+ERA_2021 <-  read_csv('data/2021 Season Pitching.csv')
+ERA_2019 <-  read_csv('data/2019 Season Pitching.csv')
+
+# add year column to ERA data
+ERA_2022 <- ERA_2022 %>% 
+  mutate(Year = 2022)
+
+ERA_2021 <- ERA_2021 %>% 
+  mutate(Year = 2021)
+
+ERA_2019 <- ERA_2019 %>% 
+  mutate(Year = 2019)
+
+
+ERA_data <- rbind(ERA_2022,ERA_2021,ERA_2019)
+ERA_data <- extract(ERA_data,Player,c("First_Name","Last_Name"), "([^ ]+) (.*)")
+ERA_data <- ERA_data %>%
+  mutate(Pitcher = paste0(Last_Name, ", ", First_Name)) %>%
+  select(Pitcher, Year, ERA)
+ERA_data$Year <- as.character(ERA_data$Year) # matchup name format to LAST, FIRST
+# trackman <- read_csv(data/All_College_TM_19_22.csv)
+# trackman <- trackman %>% 
+#   mutate(Year = format(trackman$Date, format = "%Y"))
+```
+
+# Data Clean/Preprocessing
+These are the steps we implemented to clean and manipulation to build a better predicting model.
+-   Consolidated pitch types from the approximately 10+ pitch types in Trackman down to 4 types (Fastball, Slider, Curveball, ChangeUp) by appropriately grouping similar pitches.
+-   In 2020 the NCAA baseball season was shorten with teams only playing approximately ~20% of their scheduled games due to the COVID-19 pandemic, so the 2020 data has been removed.
+- Removing unnecessary columns such as the Notes amongst other columns as they do not have an effect on the response variable ERA.
+```{r,eval=F}
+# Removing unecessary columns
+trackman <- trackman %>% 
+  select(!PositionAt110X:PositionAt110Z & !pfxx:vz0 & -Notes & -Time & -VertRelAngle)
+  
+
+#Categorizing all pitches into 5 pitch types
+trackman <- trackman %>% mutate(TaggedPitchType = replace(TaggedPitchType, TaggedPitchType == "Changeup","ChangeUp"))
+trackman <- trackman %>% mutate(TaggedPitchType = replace(TaggedPitchType, TaggedPitchType == "Knuckleball","KnuckleBall"))
+
+trackman <- trackman %>% mutate(TaggedPitchType = replace(TaggedPitchType, TaggedPitchType == "Splitter","ChangeUp"))
+trackman <- trackman %>% mutate(TaggedPitchType = replace(TaggedPitchType, TaggedPitchType == "Sinker","Two-Seam"))
+
+trackman <- trackman %>% 
+  mutate(TaggedPitchType = replace(TaggedPitchType, TaggedPitchType == "Two-Seam","Fastball"))
+trackman <- trackman %>% 
+  mutate(TaggedPitchType = replace(TaggedPitchType, TaggedPitchType == "Cutter", "Slider")) 
+  
+  trackman <- trackman %>% 
+  mutate(TaggedPitchType = replace(TaggedPitchType, TaggedPitchType == "Undefined", "Other")) %>%
+  filter(TaggedPitchType %in% c("Fastball", "Slider", "ChangeUp","Curveball"))
+
+# Data Processing
+trackman <- trackman %>% mutate(PitchIsStrike = ifelse(grepl("Ball",PitchCall), 1,0))
+
+trackman <- trackman %>% mutate(PitchIsStrike = ifelse(PitchCall== "HitByPitch", 0,PitchIsStrike)) 
+
+trackman <- trackman %>% 
+  mutate(K_IND = ifelse(KorBB== "Strikeout",1,0)) %>%
+  mutate(BB_IND = ifelse(KorBB== "Walk",1,0)) 
+
+
+# Remove 2020 data
+trackman <- trackman %>% 
+  filter(Year != 2020) 
+
+write_rds(trackman, "data/trackman.rds")
+
+#View(trackman)
+```
+
+
+
+```{r}
+trackman <- read_rds("data/trackman.rds")
+```
+
+
+Subsequently, to be able to build a model to predict ERA for a given pitcher and year, I summarized the pitching metrics for each pitcher and year. I gathered the median of each pitching metric and pitch type and calculated a couple metrics including Strike_Percent and K/BB as well for each Pitcher and Year combination. I transformed and joined the data sets to have each Pitcher and Year correspond with their respective pitching metrics and actual ERA for that season. I further cleaned the dataset eliminating players who have only thrown 1 pitch in the dataset since that is unrealistic in baseball leaving 972 pitchers (observations).
+
+```{r}
+# summarize data by pitcher and year 
+pitcher_year_grouped <- trackman %>%
+  group_by(Pitcher,Year) %>%
+  summarise(PitcherThrows = PitcherThrows,
+            Pitches = n(),
+            Strike_Percent = sum(PitchIsStrike)/Pitches,
+            K = sum(K_IND),
+            K_BB = ifelse(sum(K_IND)/sum(BB_IND) != Inf, sum(K_IND)/sum(BB_IND), K),
+            median_Distance = median(Distance, na.rm =T,na.action = na.pass),
+            median_ExitSpeed = median(ExitSpeed, na.rm =T,na.action = na.pass),
+            median_Extension = median(Extension, na.rm =T,na.action = na.pass)
+              
+  ) %>%
+  ungroup() %>%
+  select(-K)
+pitcher_year_grouped$PitcherThrows <- toupper(pitcher_year_grouped$PitcherThrows)
+
+pitcher_year_grouped$PitcherThrows <- factor(pitcher_year_grouped$PitcherThrows, c("LEFT", "RIGHT"))
+#View(pitcher_year_grouped)
+# Pitch Metrics Medians
+pitch_metrics <- trackman %>%
+  group_by(Pitcher,Year,TaggedPitchType) %>% 
+    select_if(is.numeric) %>%
+  summarize(
+      Pitches = n(),
+      median_RelSpeed = median(RelSpeed, na.rm =T,na.action = na.pass),
+      median_SpinRate = median(SpinRate, na.rm =T,na.action = na.pass),
+      median_SpinAxis = median(SpinAxis, na.rm =T,na.action = na.pass),
+      median_PlateLocHeight = median(PlateLocHeight, na.rm =T,na.action = na.pass),
+      median_PlateLocSide = median(PlateLocSide, na.rm =T,na.action = na.pass),
+      median_VertApprAngle= median(VertApprAngle, na.rm =T,na.action = na.pass),
+      median_HorzApprAngle = median(HorzApprAngle, na.rm =T,na.action = na.pass),
+      median_Angle = median(Angle, na.rm =T,na.action = na.pass),
+      median_InducedVertBreak = median(InducedVertBreak, na.rm =T,na.action = na.pass),
+      median_HorzBreak= median(HorzBreak, na.rm =T,na.action = na.pass)
+  ) %>%
+  ungroup() %>%
+  filter(Pitches >= 15) %>%
+  select(-Pitches) %>%
+  pivot_wider(
+    names_from = TaggedPitchType,
+    values_from = c(median_RelSpeed:median_HorzBreak)
+  )
+
+#View(pitch_metrics)
+#Pitch Type Medians
+      #percentile25_RelSpeed = quantile(RelSpeed, probs =.25, na.rm =T, na.action = na.pass),
+
+
+
+pitcher_year_grouped <- pitcher_year_grouped %>%
+   inner_join(pitch_metrics,
+            by = c("Pitcher", "Year")) %>%
+   left_join(ERA_data, 
+             by = c("Pitcher", "Year")) %>%
+  drop_na(ERA) %>%
+  distinct(Pitcher,Year, .keep_all = T) %>%
+  select(-Pitches) 
+ #replace(is.na(.), 0)
+
+pitcher_year_grouped <- pitcher_year_grouped %>%   filter(!if_all(c(median_RelSpeed_Slider, median_RelSpeed_Curveball,median_RelSpeed_ChangeUp), is.na))
+
+
+# pitcher_year_grouped <- pitcher_year_grouped %>%
+#   mutate(across(c(grepl("RelSpeed"),grepl("SpinRate"),
+# 
+# 
+#  ), ~replace_na(.x, min(.x, na.rm = TRUE)))) %>%
+#            mutate(across(c(), ~replace_na(0))) %>%
+#     mutate(across(c(), ~replace_na(.x, max(.x, na.rm = TRUE))))
+  
+ 
+#View(pitcher_year_grouped)
+
+write_rds(pitcher_year_grouped, "data/Pitcher_Year_dataset.rds")
+```
+
+
+```{r}
+pitcher_year <- read_rds("data/Pitcher_Year_dataset.rds")
+#View(pitcher_year)
+write_csv(pitcher_year,"data/pitcher_year.csv")
+```
+
+# EDA
+
+Looking at the number of rows in the cleaned and pivoted dataset we see we have 972 pitchers in our dataset. In machine learning we want to make sure we have ample observations to train our models on in order to better predict other players outside the scope of the dataset.
+```{r}
+paste(nrow(pitcher_year), "Pitchers in the dataset") # number of pitchers and season in the dataset
+```
+After running some analysis on our response variable, ERA, we see the variable spans the range of [0.96,11.09] with a slight right skew in the histogram. It is good to see we have a wide ERA range with high counts so that the model has a variety of pitchers to predict determing what indicates a high or low ERA. 
+```{r}
+summary(pitcher_year$ERA)
+# Summary of response variable ERA
+ggplot(pitcher_year, aes(x = ERA)) + 
+  geom_histogram()  + 
+  geom_vline(xintercept = mean(pitcher_year$ERA), linetype = 'dashed') +
+  ggtitle("Distribution of ERA")
+
+```
+Looking at the correlation matrix we can see that several features are positively correlated with each other including RelSpeed. As we take a closer look at our RelSpeed variable below, we can see the blue squares clearly.
+```{r}
+# pitcher_year_numeric <- pitcher_year %>%
+#   select(grepl("RelSpeed", names(.)))
+# pitcher_year_cor <- cor(pitcher_year_numeric, use = "complete.obs")
+# corrplot(pitcher_year_cor, method = 'color') # colorful number
+
+pitcher_year_all <- pitcher_year %>%
+  select(-PitcherThrows) %>%
+  select_if(is_numeric)
+pitcher_year_cor_all <- cor(pitcher_year_all, use = "pairwise.complete.obs")
+corrplot(pitcher_year_cor_all, method = 'color') # colorful number
+
+
+# RelSpeed Correlation
+pitcher_year_RelSpeed <- pitcher_year %>%
+  select_if(grepl("RelSpeed", names(.)))
+
+?cor
+
+pitcher_year_cor_RelSpeed <- cor(pitcher_year_RelSpeed, use = "pairwise.complete.obs")
+corrplot(pitcher_year_cor_RelSpeed, method = 'color') # colorful number
+```
+
+Looking at our K/BB dot plot, we can identify a slight downward trend meaning pitchers with higher K/BB ratio will tend to have a better ERA.  This will be a useful metric to improve the model given the relationship.
+```{r}
+ggplot(pitcher_year, aes(x = K_BB, y= ERA)) + 
+  geom_point() +
+  geom_smooth(method = "loess") +
+  xlab("K/BB")+
+  ggtitle("K/BB vs ERA")
+```
+For median_HorzApprAngle_Slider, we must group the data into the handedness of the Pitcher (Left or Right Handed) since the metric will be negative for Right handed pitchers (RHP) and positive for Left handed pitchers (LHP). A higher magnitude (absolute value of `HorzApprAngle`) means indicates it is a better Slider. From the plot we can see there is a slight decrease in ERA as the metric becomes more negative for RHP or more positive for LHP. This difference is accounted for using the `PitcherThrows` variable as a dummy variable in our recipe. 
+```{r}
+ggplot(pitcher_year, aes(x = median_HorzApprAngle_Slider,y = ERA, color = PitcherThrows))+
+  geom_point() +
+  geom_smooth(aes(group = pitcher_year$PitcherThrows),
+                method = "loess") +
+  ggtitle("Median Slider HorzApprAngle vs ERA")
+```
+
+From this visual, we can see that a faster with higher fastball velocity (RelSpeed) in MPH tends to have a lower ERA. This supports prior knowledge on baseball and as a result will serve as a good predictor of ERA in our model.
+```{r}
+paste("Median of all Fastballs in the data",median(pitcher_year$median_RelSpeed_Fastball, na.rm=T, na.action=na.pass))
+ggplot(pitcher_year, aes(x = median_RelSpeed_Fastball,y = ERA))+
+  geom_point() +
+  geom_vline(xintercept =median(pitcher_year$median_RelSpeed_Fastball, na.rm=T, na.action=na.pass)
+ , linetype = 'dashed') +
+  geom_smooth(method = "loess") +
+  ggtitle("Fastball MPH vs ERA")
+```
+
+# Data Splitting
+
+* Splitting the data into a training set and test set
+* 70% training set and 30% testing set
+
+I originally had a 80%/20% training/testing set split but opted to go with the slightly smaller training set since it may help a bit with overfitting to the training data. I also stratified by our response variable ERA so the training and testing set will cover the range of values for the variable. I will train the models on the training dataset and then test the best model on the testing data.
+
+```{r}
+set.seed(232)
+
+pitcher_year_sub <- pitcher_year %>% select(-c(Pitcher,Year))
+data_split <- initial_split(pitcher_year_sub, prop = .7, strata = ERA)
+
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+```
+
+# Cross-Validation
+
+* 5 Fold Cross-Validation on the training set.
+
+5 fold cross-validation is the process of dividing our training data into 5 groups or equivantly the folds. 4 of the folds will serve as the training data and the remaining fold will serve as the testing data. This process is repeated until each fold is the testing set. Cross validation is used to eliminate or reduce the possibility of overfitting.
+
+```{r}
+data_folds <- vfold_cv(train_data, v = 5)
+```
+
+# Model Fitting
+
+We will fit models and tune model parameters as necessary on the training data...
+
+* Linear Regression
+* Regularized Regression
+* Random Forest
+* Boosted Trees
+
+### Recipe
+In this recipe, I imputed the missing values with the median. The most common missing value appears due to the nature of a pitcher's pitch type arsenal. In the dataset, there are 4 pitch types but each pitcher does not necessarily throw all 4 pitch types and will not have data on the given pitch type hence the NA values in the data. After looking at the correlation matrix of a the predictors, we can see the correlation in the matrix from the "blue squares" for each of these metrics. Using RelSpeed as an example, the metric is highly positively correlated for each pitch meaning a person that throws a Fastball faster is apt to throw his other pitches faster as well. To combat this correlation I normalize the predictors and implement principal components for each of the correlated metrics: `RelSpeed` and `HorzApprAngle`.
+
+```{r}
+recip <- recipe(ERA ~ ., data = train_data) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_dummy(PitcherThrows) %>%
+  step_normalize(all_numeric_predictors())  %>%
+  step_pca(median_RelSpeed_Fastball,median_RelSpeed_Curveball,median_RelSpeed_Slider,median_RelSpeed_ChangeUp, median_HorzApprAngle_Fastball,median_HorzApprAngle_Curveball,median_HorzApprAngle_Slider,median_HorzApprAngle_ChangeUp, num_comp=2)
+
+
+#step_dummy - makes PitcherThrows (categorical variable) a dummy variable (factor)
+# step_pca make 2 principal components of the 2 variables
+
+```
+
+### Linear Regression
+We fit a linear regression on the training data.
+
+Fitted model parameters for the linear regression...
+```{r}
+lm_model <- linear_reg() %>% 
+  set_engine("lm")
+
+lm_workflow <- workflow() %>%
+  add_model(lm_model) %>%
+  add_recipe(recip)
+
+lm_fit <- fit(lm_workflow,train_data)
+
+lm_fit %>% extract_fit_parsnip() %>% tidy()
+```
+
+
+```{r}
+ERA_predict <- predict(lm_fit, new_data = train_data %>% select(-ERA))
+ERA_predict <- bind_cols(ERA_predict, train_data %>% select(ERA))
+
+# making a table with our predicted ERA values and viewing the difference
+
+ERA_predict <- ERA_predict %>%
+  mutate(Difference = .pred-ERA)
+
+
+ERA_metric_set <- metric_set(rmse, rsq)
+ERA_metric_set <- ERA_metric_set(ERA_predict, 
+                                 truth = ERA, 
+                                 estimate = .pred)
+tibble(ERA_metric_set)
+
+lm_results <- augment(lm_fit, new_data = train_data) %>%
+  rmse(truth = ERA, estimate = .pred) %>%
+  mutate(model = "Linear Regression")
+```
+
+### Regularized Regression
+
+In the regularized regression model, we tune our `mixture` parameter from 0 to 1 and `penalty` parameter from -5 to 5 using 5 levels.
+```{r}
+ridge_model <- linear_reg(mixture = tune(), penalty = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("glmnet")
+
+# workflow
+ridge_workflow <- workflow() %>% 
+  add_recipe(recip) %>% 
+  add_model(ridge_model)
+
+# Mixture and Penalty Tuning grid
+mixture_penalty_grid <- grid_regular(mixture(range = c(0,1)),
+                                     penalty(range = c(-5, 5)), 
+                                     levels = 5)
+
+# workflow
+ridge_workflow <- workflow() %>% 
+  add_recipe(recip) %>% 
+  add_model(ridge_model)
+
+```
+
+```{r,eval =F}
+tune_ridge <- tune_grid(
+  ridge_workflow,
+  resamples = data_folds, 
+  grid = mixture_penalty_grid
+)
+write_rds(tune_ridge, "models/ridge_tuned.rds")
+
+```
+
+
+Looking at the plot to help determine the amount of regularization, we see the lowest rmse comes from a ridge regression, penalty = 0 and the highest rsq comes from a penalty term = 1. We will use the `select_best()` function to determine which model to fit to the training data. 
+```{r}
+tune_ridge <- read_rds("models/ridge_tuned.rds")
+collect_metrics(tune_ridge)
+autoplot(tune_ridge)
+```
+
+We fit the Regularized regression model and the best fit on the folds using the rmse metric is `penalty` = 1 (Ridge regression) and `mixture` = 0.
+
+```{r}
+best_penalty_mixture <- select_best(tune_ridge, metric = "rmse")
+best_penalty_mixture
+
+ridge_final <- finalize_workflow(ridge_workflow, best_penalty_mixture)
+
+ridge_final_fit <- fit(ridge_final, data = train_data)
+```
+
+
+Now, we fit our best fitting regularized regression model on the folds to the training set.
+
+```{r}
+ridge_results <- augment(ridge_final_fit, new_data = train_data) %>%
+  rmse(truth = ERA, estimate = .pred) %>%
+  mutate(model = "Ridge")
+
+ridge_results
+```
+
+
+
+### Random Forest
+
+In the random forest, we tune our `mtry` parameter from 2 to 10,  `min_n` parameter from 2 to 10, and `trees` parameter from 200 to 1000 using 4 levels.
+
+```{r}
+?rand_forest()
+
+rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = tune()) %>%
+  set_engine("randomForest", importance = T) %>%
+  set_mode("regression")
+
+rf_workflow <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(recip)
+
+param_grid_rf <- grid_regular(mtry(range = c(2,10)),
+                           min_n(range = c(2,10)),
+                           trees(range= c(200,1000)),
+                           levels = 4)
+
+```
+
+```{r,eval =F}
+tune_rf <- tune_grid(
+  rf_workflow, 
+  resamples = data_folds, 
+  grid = param_grid_rf, 
+  metrics = metric_set(rmse,rsq)
+)
+
+write_rds(tune_rf,"models/rf_tune.rds")
+
+
+```
+
+We fit the Random Forest and the best fit on the folds using the rmse metric is choosing `mtry` = 2 (the # of parameters to randomly select), `trees` = 200, and `min_n` = 4 (the minimum number of observations in a branch)
+
+```{r}
+tune_rf <- read_rds("models/rf_tune.rds")
+rf_best_rmse <- tune_rf %>% collect_metrics() %>% 
+  arrange(desc(mean)) %>% 
+  slice(1)
+rf_best_rmse
+```
+```{r}
+rf_final <- finalize_workflow(rf_workflow, rf_best_rmse)
+rf_fit <- fit(rf_final, data = train_data)
+
+#rf_fit %>% extract_fit_parsnip() %>% vip()
+```
+
+Now, we fit our best fitting random forest model on the folds to the training set.
+```{r}
+rf_results <- augment(rf_fit, new_data = train_data) %>%
+  rmse(truth = ERA, estimate = .pred) %>%
+  mutate(model = "Random Forest")
+
+rf_results
+```
+
+
+### Boosting
+
+In the boosted trees model, we tune our trees parameter from 200 to 1000 and tree_depth parameter from 2 to 4 using 3 levels.
+
+```{r}
+boost_model <- boost_tree(trees = tune(), tree_depth = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+boost_workflow <- workflow() %>%
+  add_model(boost_model) %>%
+  add_recipe(recip)
+
+param_grid_boost <- grid_regular(trees(range = c(200,1000)),
+                           tree_depth(range = c(2,4)), 
+                           levels = 3)
+
+
+
+```
+
+```{r,eval =F}
+tune_boost <- tune_grid(
+  boost_workflow, 
+  resamples = data_folds, 
+  grid = param_grid_boost, 
+  metrics = metric_set(rmse, rsq)
+)
+write_rds(tune_boost,"models/boost_tune.rds")
+
+
+```
+
+We fit the boosted trees model and the best fit on the folds using the rmse metric is `trees` = 1000 and `tree_depth` = 2. 
+```{r}
+tune_boost <- read_rds("models/boost_tune.rds")
+
+boost_best_rmse <- tune_boost %>% collect_metrics() %>% 
+  arrange(desc(mean)) %>% 
+  slice(1)
+boost_best_rmse
+
+
+boost_final <- finalize_workflow(boost_workflow, boost_best_rmse)
+boost_fit <- fit(boost_final, data = train_data)
+```
+Now, we fit our best fitting boosted trees model on the folds to the training set.
+```{r}
+boost_results <- augment(boost_fit, new_data = train_data) %>%
+  rmse(truth = ERA, estimate = .pred) %>%
+  mutate(model = "Boosted")
+
+boost_results
+```
+
+# Results
+
+Using rmse, we see that the boosted trees model had the lowest rmse and performed the best on the training data. By examining the table, we can see the linear and ridge regression perform very poorly on the training data as they have an error estimate of over 1.30. In this research question, a 1.32 error difference in ERA is enormous.  To put this into context of baseball, looking to the professionals leagues, Major League Baseball (MLB), a player with a 3.00 ERA versus a player with a 4.32 ERA is likely to get paid tens or even hundred millions of dollars more. We will now fit the boosted trees model on the test set to analyze our model's performance since it has the lowest rmse on the training data.
+```{r}
+ all_results <- rbind(lm_results,ridge_results, rf_results, boost_results) 
+ all_results %>%  arrange(desc(.estimate))
+```
+
+## Best Model/Testing
+
+Unfortunately, after many attempts and editions of the recipe, data processing, and model building, the boosted trees model is overfitting since training rmse is much higher than test rmse.
+
+```{r}
+boost_test_results <- augment(boost_fit, new_data = test_data) %>%
+  rmse(truth = ERA, estimate = .pred)
+
+
+boost_test_results
+```
+
+# Conclusion
+
+In this project, I fit a linear regression, ridge regression, random forest, and boosted tree models with the boosted tree model performing the best on the training data. I evaluated the "best" model using rmse and it had the lowest at .029 while the ridge and linear regression had much higher rmse's above 1 and random forest was in between the regressions and the boosted trees models. In conclusion, the boosted trees model fit using the features in the dataset, primarily the median throughout a season of each pitching metric, poorly predicts ERA as the model heavily over fits to the training data.
+
+I was pretty surprised that the model heavily over fit and did not better predict since often times as a Data Analyst intern with the UCSB Baseball team, we use these metrics to evaluate a pitcher and grade their pitch quality. However, I suspect this could be due to a number of reasons.
+- Having to impute hundreds of missing data points due to pitchers' not having a certain pitch type produced undesired outcomes.
+- Trackman data only captures a percentage of a players' games thorughtout the season. In contrast, the ERA we used as the response variable in the model is taken from the entire season regardless if Trackman data tracking is available or unavailable. Furthermore, for example, a pitcher could have pitched poorly during games where Trackman data is collected, but in his other games his pitching metrics perform better.
+
+Some of the future steps I want to take in building this model is to go beyond just the median and look at the "best" of each pitching metric or additional percentiles so that our models can have additional features and better fit beyond just a single median score. Instead of only additional metrics (percentiles, maximum), more pitchers, meaning more data, could indicate clearer relationships between ERA and a metric. I state this due to the high variance in the data when looking at the metric vs ERA relationship in our exploratory data analysis.
+
+
+# Final Thoughts
+I want to thank you Professor Coburn for introducing and intriguing my interest in machine learning this quarter. I also want to thank you for the help and office hours and giving us the students an opportunity to form our own project idea and passionately pursue a sound, functional model. Machine learning is an area in data science I really want to grow in and improve, so I will continue to fine tune or create new models over winter break. I would be more than happy to hear additional changes, improvements, or possible options to explore to build a working model!
+
